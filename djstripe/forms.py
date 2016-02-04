@@ -9,7 +9,7 @@
 
 from django import forms
 
-from .settings import PLAN_CHOICES
+from .models import PLAN_CHOICES
 
 
 class PlanForm(forms.Form):

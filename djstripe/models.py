@@ -24,7 +24,7 @@ from .managers import CustomerManager, ChargeManager, TransferManager
 from .signals import WEBHOOK_SIGNALS
 from .signals import subscription_made, cancelled, card_changed
 from .signals import webhook_processing_error
-
+from collections import OrderedDict
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 stripe.api_version = getattr(settings, "STRIPE_API_VERSION", "2012-11-07")
@@ -32,6 +32,8 @@ stripe.api_version = getattr(settings, "STRIPE_API_VERSION", "2012-11-07")
 
 if djstripe_settings.PY3:
     unicode = str
+
+
 
 
 def convert_tstamp(response, field_name=None):
@@ -47,7 +49,7 @@ def convert_tstamp(response, field_name=None):
 
 class StripeObject(TimeStampedModel):
 
-    stripe_id = models.CharField(max_length=50, unique=True)
+    stripe_id = models.CharField(max_length=100, unique=True)
 
     class Meta:
         abstract = True
@@ -464,7 +466,7 @@ class Customer(StripeObject):
         if sub:
             try:
                 sub_obj = self.current_subscription
-                sub_obj.plan = djstripe_settings.plan_from_stripe_id(sub.plan.id)
+                sub_obj.plan = Plan.objects.get(stripe_id=sub.plan.id).name
                 sub_obj.current_period_start = convert_tstamp(
                     sub.current_period_start
                 )
@@ -481,7 +483,7 @@ class Customer(StripeObject):
             except CurrentSubscription.DoesNotExist:
                 sub_obj = CurrentSubscription.objects.create(
                     customer=self,
-                    plan=djstripe_settings.plan_from_stripe_id(sub.plan.id),
+                    plan=plan_from_stripe_id(sub.plan.id),
                     current_period_start=convert_tstamp(
                         sub.current_period_start
                     ),
@@ -514,9 +516,7 @@ class Customer(StripeObject):
 
     def update_plan_quantity(self, quantity, charge_immediately=False):
         self.subscribe(
-            plan=djstripe_settings.plan_from_stripe_id(
-                self.stripe_customer.subscription.plan.id
-            ),
+            plan=Plan.objects.filter(stripe_id=self.stripe_customer.subscription.plan.id),
             quantity=quantity,
             charge_immediately=charge_immediately
         )
@@ -528,26 +528,26 @@ class Customer(StripeObject):
         Trial_days corresponds to the value specified by the selected plan
         for the key trial_period_days.
         """
-        if ("trial_period_days" in djstripe_settings.PAYMENTS_PLANS[plan]):
-            trial_days = djstripe_settings.PAYMENTS_PLANS[plan]["trial_period_days"]
-
+        plan = Plan.objects.get(name=plan)
+        if plan.trial_period_days:
+            trial_days = plan.trial_period_days
         if trial_days:
             resp = cu.update_subscription(
-                plan=djstripe_settings.PAYMENTS_PLANS[plan]["stripe_plan_id"],
+                plan=plan.stripe_id,
                 trial_end=timezone.now() + datetime.timedelta(days=trial_days),
                 prorate=prorate,
                 quantity=quantity
             )
         else:
             resp = cu.update_subscription(
-                plan=djstripe_settings.PAYMENTS_PLANS[plan]["stripe_plan_id"],
+                plan=plan.stripe_id,
                 prorate=prorate,
                 quantity=quantity
             )
         self.sync_current_subscription()
         if charge_immediately:
             self.send_invoice()
-        subscription_made.send(sender=self, plan=plan, stripe_response=resp)
+        subscription_made.send(sender=self, plan=plan.name, stripe_response=resp)
 
     def charge(self, amount, currency="usd", description=None, send_receipt=True, **kwargs):
         """
@@ -624,7 +624,7 @@ class CurrentSubscription(TimeStampedModel):
         related_name="current_subscription",
         null=True
     )
-    plan = models.CharField(max_length=100)
+    plan = models.CharField(max_length=150)
     quantity = models.IntegerField()
     start = models.DateTimeField()
     # trialing, active, past_due, canceled, or unpaid
@@ -640,7 +640,8 @@ class CurrentSubscription(TimeStampedModel):
     amount = models.DecimalField(decimal_places=2, max_digits=7)
 
     def plan_display(self):
-        return djstripe_settings.PAYMENTS_PLANS[self.plan]["name"]
+        PAYMENTS_PLANS = get_plans()
+        return PAYMENTS_PLANS[self.plan]["name"]
 
     def status_display(self):
         return self.status.replace("_", " ").title()
@@ -746,7 +747,7 @@ class Invoice(StripeObject):
             invoice.period_end = period_end
 
             if item.get("plan"):
-                plan = djstripe_settings.plan_from_stripe_id(item["plan"]["id"])
+                plan = Plan.objects.filter(stripe_id=item["plan"]["id"])
             else:
                 plan = ""
 
@@ -812,12 +813,12 @@ class InvoiceItem(TimeStampedModel):
     proration = models.BooleanField(default=False)
     line_type = models.CharField(max_length=50)
     description = models.CharField(max_length=200, blank=True)
-    plan = models.CharField(max_length=100, blank=True)
+    plan = models.CharField(max_length=150, blank=True)
     quantity = models.IntegerField(null=True)
 
     def plan_display(self):
         # TODO - needs test
-        return djstripe_settings.PAYMENTS_PLANS[self.plan]["name"]
+        return PAYMENTS_PLANS[self.plan]["name"]
 
 
 class Charge(StripeObject):
@@ -921,7 +922,7 @@ INTERVALS = (
 class Plan(StripeObject):
     """A Stripe Plan."""
 
-    name = models.CharField(max_length=100, null=False)
+    name = models.CharField(max_length=150, null=False)
     currency = models.CharField(
         choices=djstripe_settings.CURRENCIES,
         max_length=10,
@@ -997,3 +998,39 @@ class Plan(StripeObject):
         """Return the plan data from Stripe."""
         # TODO - needs test
         return stripe.Plan.retrieve(self.stripe_id)
+
+
+def get_plans():
+    payment_plans = {}
+    for plan in Plan.objects.all():
+        plan_dict = {}
+        payment_plans[plan.name] = plan_dict
+        plan_dict.update(
+            stripe_plan_id=plan.stripe_id,
+            name=plan.name,
+            description="",
+            price=plan.amount,
+            currency=plan.currency,
+            interval=plan.interval
+        )
+    return payment_plans
+try:
+    PAYMENTS_PLANS = get_plans()
+    PAYMENT_PLANS = OrderedDict(sorted(PAYMENTS_PLANS.items(), key=lambda t: t[1]['price']))
+    PLAN_CHOICES = [(plan, PAYMENTS_PLANS[plan].get("name", plan)) for plan in PAYMENTS_PLANS]
+
+    PLAN_LIST = []
+    for p in PAYMENTS_PLANS:
+        if PAYMENTS_PLANS[p].get("stripe_plan_id"):
+            plan = PAYMENTS_PLANS[p]
+            plan['plan'] = p
+            PLAN_LIST.append(plan)
+except:
+    PAYMENTS_PLANS = []
+    PAYMENT_PLANS = []
+    PLAN_CHOICES = []
+    PLAN_LIST = []
+
+
+def plan_from_stripe_id(stripe_id):
+    return Plan.objects.filter(stripe_id=stripe_id)

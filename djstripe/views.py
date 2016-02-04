@@ -25,7 +25,7 @@ from .models import CurrentSubscription
 from .models import Customer
 from .models import Event
 from .models import EventProcessingException
-from .settings import PLAN_LIST
+from .models import PLAN_LIST
 from .settings import CANCELLATION_AT_PERIOD_END
 from .settings import subscriber_request_callback
 from .settings import PRORATION_POLICY_FOR_UPGRADES
